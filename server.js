@@ -297,7 +297,7 @@ async function handleWebhookLogic(req, res) {
                         { id: l1Id },
                         { $addToSet: { "referrals.level1": chatId } }
                     );
-                    sendTelegramMessage(l1Id, `🎉 *New Level 1 Referral Joined!*\nUser ID: \`${chatId}\``);
+                    sendTelegramMessage(l1Id, `🎁 *New Level 1 Referral Joined!*\nUser ID: \`${chatId}\``);
 
                     const refL1 = await User.findOne({ id: l1Id });
                     if (refL1 && refL1.referredBy) {
@@ -318,7 +318,7 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                const vercelAppUrl = "https://lite-core.vercel.app/";
+                const vercelAppUrl = "https://lite-core-1.vercel.app/";
                 const welcomeCaption = `🎁 *Welcome to Lite Core!*\n\nReady to grow your portfolio?\n\n✅ Earn LTC\n✅ Invite Friends\n✅ Instant Payouts\n\n🚀 *Launch the App to begin your journey!*`;
                 const startPhotoUrl = "https://ibb.co/ymZ191Fr";
                 
@@ -1246,7 +1246,6 @@ app.post('/api/withdraw', async (req, res) => {
     }
 
     if (u.balance < amt) {
-        let errMessage = "Gaaffiin kun sirriitti qabamee jira.";
         return res.status(400).json({ success: false, message: "Insufficient balance for withdrawal!" });
     }
 
