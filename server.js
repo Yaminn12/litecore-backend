@@ -2,13 +2,85 @@ const express = require('express');
 const mongoose = require('mongoose');
 const app = express();
 
-const BOT_TOKEN = "8977720240:AAFIn6-XE3NpxV9wjqgCgYlf5P3DlV6SoPU";
-const ADMIN_ID = "7108686404";
+// ================== SETTINGS ==================
+// IMPORTANT: put these in Render -> Environment (never write secrets in code)
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) console.error('❌ BOT_TOKEN is missing! Add BOT_TOKEN in Render -> Environment.');
+const ADMIN_ID = process.env.ADMIN_ID || "7108686404";
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
 
+// ================== MINING RULES ==================
+// 1 GHS = $1.  Paid plan: every GHS earns $0.30 per day for 10 days.
+// Free plan (new users / no active paid plan): $0.01 per day.
+// Deposit NEVER adds to the user's balance. Only "Collect" (claim) adds mined profit.
+const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
+const PAID_RATE_PER_GHS_USD = 0.30;
+const FREE_DAILY_USD = 0.01;
+
+// Live LTC price in USDT (cached 60 seconds). Balance is stored in LTC.
+let ltcPriceCache = { price: 60, time: 0 };
+async function getLtcPrice() {
+    if (Date.now() - ltcPriceCache.time < 60000) return ltcPriceCache.price;
+    try {
+        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=LTCUSDT');
+        const d = await r.json();
+        const p = parseFloat(d.price);
+        if (p > 0) { ltcPriceCache = { price: p, time: Date.now() }; return p; }
+    } catch (e) {}
+    try {
+        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd');
+        const d = await r.json();
+        const p = Number(d && d.litecoin && d.litecoin.usd);
+        if (p > 0) { ltcPriceCache = { price: p, time: Date.now() }; return p; }
+    } catch (e) {}
+    return ltcPriceCache.price;
+}
+
+function isPaidPlanActive(u, now = Date.now()) {
+    return u.planActive !== false && Number(u.ghs) > 0 && !(u.planExpiryDate > 0 && now >= u.planExpiryDate);
+}
+
+function dailyUsdRate(u, now = Date.now()) {
+    return isPaidPlanActive(u, now) ? Number(u.ghs) * PAID_RATE_PER_GHS_USD : FREE_DAILY_USD;
+}
+
+// USD mined since lastClaimTime (paid rate until the plan ends, free rate after)
+function accrueUsd(u, now = Date.now()) {
+    const last = Number(u.lastClaimTime) || now;
+    if (now <= last) return 0;
+    let usd = 0;
+    let cursor = last;
+    if (u.planActive !== false && Number(u.ghs) > 0) {
+        const paidEnd = (u.planExpiryDate > 0) ? Math.min(now, u.planExpiryDate) : now;
+        if (paidEnd > cursor) {
+            usd += ((paidEnd - cursor) / 1000) * (Number(u.ghs) * PAID_RATE_PER_GHS_USD / 86400);
+            cursor = paidEnd;
+        }
+    }
+    if (now > cursor) {
+        usd += ((now - cursor) / 1000) * (FREE_DAILY_USD / 86400);
+    }
+    return usd;
+}
+
+// Lock in the profit earned so far (at the OLD rate) before the plan changes.
+function settleAccrual(u, now = Date.now()) {
+    u.accruedUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
+    u.lastClaimTime = now;
+}
+
+function expireUserPlan(u, now = Date.now()) {
+    settleAccrual(u, now);
+    u.ghs = 0;
+    u.planActive = false;
+    u.planExpiryDate = 0;
+    u.planStartDate = 0;
+}
+
+// ================== DATABASE ==================
 mongoose.connect(MONGO_URI)
     .then(async () => {
         console.log('✅ Connected to MongoDB Atlas Successfully!');
@@ -23,7 +95,7 @@ mongoose.connect(MONGO_URI)
                             let parsedTime = Date.parse(paidDep.date);
                             if (!isNaN(parsedTime)) {
                                 u.planStartDate = parsedTime;
-                                u.planExpiryDate = parsedTime + (10 * 24 * 60 * 60 * 1000);
+                                u.planExpiryDate = parsedTime + PLAN_DURATION_MS;
                                 await u.save();
                             }
                         }
@@ -31,30 +103,13 @@ mongoose.connect(MONGO_URI)
                 }
 
                 if (u.planActive && u.planExpiryDate && u.planExpiryDate > 0 && currentTime >= u.planExpiryDate) {
-                    u.ghs = 0;
-                    u.planActive = false;
-                    u.planExpiryDate = 0;
-                    u.planStartDate = 0;
-                    await u.save();
-                    continue;
-                }
-
-                let realDepositSum = 0;
-                if (u.deposits && Array.isArray(u.deposits)) {
-                    u.deposits.forEach(d => {
-                        if (d.status === 'PAID') {
-                            realDepositSum += Number(d.usdtAmount || 1);
-                        }
-                    });
-                }
-                if (u.planActive && u.ghs !== realDepositSum && realDepositSum > 0) {
-                    u.ghs = realDepositSum;
+                    expireUserPlan(u, currentTime);
                     await u.save();
                 }
             }
-            console.log('✅ All users GHS powers & 10-day plan expiries auto-synced!');
+            console.log('✅ All users plans & 10-day plan expiries auto-synced!');
         } catch (err) {
-            console.log('Auto-sync GHS error:', err);
+            console.log('Auto-sync error:', err);
         }
     })
     .catch(err => console.error('❌ MongoDB Connection Error:', err));
@@ -65,12 +120,13 @@ const userSchema = new mongoose.Schema({
     balance: { type: Number, default: 0 },
     ghs: { type: Number, default: 0 },
     lastClaimTime: { type: Number, default: Date.now },
+    accruedUsd: { type: Number, default: 0 },
     deposits: { type: Array, default: [] },
     withdrawals: { type: Array, default: [] },
     isBanned: { type: Boolean, default: false },
     planActive: { type: Boolean, default: true },
-    planStartDate: { type: Number, default: 0 },  
-    planExpiryDate: { type: Number, default: 0 },   
+    planStartDate: { type: Number, default: 0 },
+    planExpiryDate: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
     referrals: {
         level1: { type: [String], default: [] },
@@ -117,6 +173,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
 
@@ -130,6 +187,7 @@ function checkAdminAuth(req, res, next) {
     return res.redirect('/admin/login');
 }
 
+// ================== TELEGRAM HELPERS ==================
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
     try {
         let body = { chat_id: chatId, text: text, parse_mode: 'Markdown' };
@@ -184,23 +242,21 @@ async function answerCallbackQuery(callbackQueryId, text) {
     }
 }
 
+// ================== AUTO PLAN EXPIRY (every 5 minutes) ==================
 setInterval(async () => {
     try {
         const currentTime = Date.now();
-        const expiredUsers = await User.find({ 
-            planActive: true, 
-            planExpiryDate: { $gt: 0, $lte: currentTime } 
+        const expiredUsers = await User.find({
+            planActive: true,
+            planExpiryDate: { $gt: 0, $lte: currentTime }
         });
 
         for (let u of expiredUsers) {
-            u.ghs = 0;
-            u.planActive = false;
-            u.planExpiryDate = 0;
-            u.planStartDate = 0;
+            expireUserPlan(u, currentTime);
             await u.save();
 
             sendTelegramMessage(
-                u.id, 
+                u.id,
                 `❌ *Plan Expired:* Your plan was expired plzz renew plan agin 🚀`
             );
         }
@@ -245,6 +301,80 @@ function getPlanDaysFormat(user) {
     return `${daysPassed}/10 Days`;
 }
 
+// ================== REQUEST APPROVE / REJECT (used by bot buttons and admin panel) ==================
+function setRequestStatus(list, reqId, pendingNames, newStatus) {
+    let idx = list.findIndex(x => String(x.id) === String(reqId));
+    if (idx !== -1) {
+        list[idx].status = newStatus;
+    } else {
+        let p = list.find(x => pendingNames.includes(x.status));
+        if (p) p.status = newStatus;
+    }
+}
+
+async function payReferralCommissions(depositUser, amount) {
+    const rates = [0.15, 0.03, 0.01];
+    let current = depositUser;
+    for (let lvl = 1; lvl <= 3; lvl++) {
+        if (!current.referredBy) break;
+        const refUser = await User.findOne({ id: current.referredBy });
+        if (!refUser) break;
+        const comm = amount * rates[lvl - 1];
+        refUser.balance += comm;
+        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + comm;
+        refUser.markModified('refEarnings');
+        await refUser.save();
+        sendTelegramMessage(refUser.id, `🎁 Received +${comm.toFixed(4)} USDT (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`);
+        current = refUser;
+    }
+}
+
+async function approveRequest(reqDoc, u, reqId) {
+    if (reqDoc.type === 'deposit' && u) {
+        const depAmount = reqDoc.usdtAmount ? Number(reqDoc.usdtAmount) : 1;
+
+        setRequestStatus(u.deposits, reqId, ['PENDING'], 'PAID');
+        u.markModified('deposits');
+
+        // 1) lock in profit earned so far at the OLD rate
+        const now = Date.now();
+        settleAccrual(u, now);
+
+        // 2) activate the bought plan. NO balance is added to the user.
+        const hadPaidPlan = isPaidPlanActive(u, now);
+        u.ghs = hadPaidPlan ? Number(u.ghs) + depAmount : depAmount;
+        u.planActive = true;
+        u.planStartDate = now;
+        u.planExpiryDate = now + PLAN_DURATION_MS;
+
+        await u.save();
+        await payReferralCommissions(u, depAmount);
+
+        sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
+    } else if (reqDoc.type === 'withdraw' && u) {
+        setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'PAID');
+        u.markModified('withdrawals');
+        await u.save();
+        sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} LTC has been approved!`);
+    }
+}
+
+async function rejectRequest(reqDoc, u, reqId) {
+    if (reqDoc.type === 'deposit' && u) {
+        setRequestStatus(u.deposits, reqId, ['PENDING'], 'DECLINED');
+        u.markModified('deposits');
+        await u.save();
+        sendTelegramMessage(reqDoc.userId, `❌ Your deposit request was declined.`);
+    } else if (reqDoc.type === 'withdraw' && u) {
+        u.balance += parseFloat(reqDoc.amount);
+        setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'DECLINED');
+        u.markModified('withdrawals');
+        await u.save();
+        sendTelegramMessage(reqDoc.userId, `❌ Your withdrawal request was declined and funds refunded.`);
+    }
+}
+
+// ================== TELEGRAM WEBHOOK ==================
 async function handleWebhookLogic(req, res) {
     const update = req.body;
     res.sendStatus(200);
@@ -321,12 +451,12 @@ async function handleWebhookLogic(req, res) {
                 const vercelAppUrl = "https://lite-core-1.vercel.app/";
                 const welcomeCaption = `🎁 *Welcome to Lite Core!*\n\nReady to grow your portfolio?\n\n✅ Earn LTC\n✅ Invite Friends\n✅ Instant Payouts\n\n🚀 *Launch the App to begin your journey!*`;
                 const startPhotoUrl = "https://ibb.co/ymZ191Fr";
-                
+
                 const webAppMarkup = {
                     inline_keyboard: [
                         [
-                            { text: "✅ Lite Core Payments", url: "https://t.me/bnbvaultpayments" },
-                            { text: "💬 Lite Core Official", url: "https://t.me/+sN2MH1z94A9lOTFk" }
+                            { text: "✅ Lite Core Payments", url: "https://t.me/litecorepayments" },
+                            { text: "💬 Lite Core Official", url: "https://t.me/litecoreofficial" }
                         ],
                         [
                             { text: "🔨 ➔ Open Lite Core Mining ⛏️", web_app: { url: vercelAppUrl } }
@@ -358,128 +488,21 @@ async function handleWebhookLogic(req, res) {
 
                 const isApprove = data.startsWith('approve_');
                 const reqId = data.replace(isApprove ? 'approve_' : 'reject_', '');
-                const reqDoc = await PendingRequest.findOne({ reqId });
 
+                // atomic: only one tap can take the request (prevents double credit)
+                const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
                 if (!reqDoc) return answerCallbackQuery(query.id, "Request already handled!");
 
                 const u = await User.findOne({ id: reqDoc.userId });
 
                 if (isApprove) {
-                    if (reqDoc.type === 'deposit' && u) {
-                        let numericDepAmount = reqDoc.usdtAmount ? Number(reqDoc.usdtAmount) : 1;
-                        
-                        let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
-                        if (idx !== -1) {
-                            u.deposits[idx].status = 'PAID';
-                        } else {
-                            let p = u.deposits.find(d => d.status === 'PENDING');
-                            if (p) p.status = 'PAID';
-                        }
-                        u.markModified('deposits');
-
-                        let totalApprovedGhs = 0;
-                        u.deposits.forEach(d => {
-                            if (d.status === 'PAID') {
-                                totalApprovedGhs += Number(d.usdtAmount || 1);
-                            }
-                        });
-                        u.ghs = totalApprovedGhs;
-                        u.planActive = true;
-                        
-                        u.planStartDate = Date.now();
-                        u.planExpiryDate = Date.now() + (10 * 24 * 60 * 60 * 1000);
-
-                        await u.save();
-
-                        if (u.referredBy) {
-                            let refL1 = await User.findOne({ id: u.referredBy });
-                            if (refL1) {
-                                let commL1 = numericDepAmount * 0.15;
-                                refL1.balance += commL1;
-                                refL1.refEarnings.level1 = (refL1.refEarnings.level1 || 0) + commL1;
-                                refL1.markModified('refEarnings');
-                                await refL1.save();
-                                sendTelegramMessage(refL1.id, `🎁 Received +${commL1.toFixed(4)} USDT (15% Level 1 Referral Commission)!`);
-
-                                if (refL1.referredBy) {
-                                    let refL2 = await User.findOne({ id: refL1.referredBy });
-                                    if (refL2) {
-                                        let commL2 = numericDepAmount * 0.03;
-                                        refL2.balance += commL2;
-                                        refL2.refEarnings.level2 = (refL2.refEarnings.level2 || 0) + commL2;
-                                        refL2.markModified('refEarnings');
-                                        await refL2.save();
-                                        sendTelegramMessage(refL2.id, `🎁 Received +${commL2.toFixed(4)} USDT (3% Level 2 Referral Commission)!`);
-
-                                        if (refL2.referredBy) {
-                                            let refL3 = await User.findOne({ id: refL2.referredBy });
-                                            if (refL3) {
-                                                let commL3 = numericDepAmount * 0.01;
-                                                refL3.balance += commL3;
-                                                refL3.refEarnings.level3 = (refL3.refEarnings.level3 || 0) + commL3;
-                                                refL3.markModified('refEarnings');
-                                                await refL3.save();
-                                                sendTelegramMessage(refL3.id, `🎁 Received +${commL3.toFixed(4)} USDT (1% Level 3 Referral Commission)!`);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${numericDepAmount} GHS Mining Power added (Valid for 10 Days).`);
-                    } else if (reqDoc.type === 'withdraw' && u) {
-                        let idx = u.withdrawals.findIndex(w => String(w.id) === String(reqId));
-                        if (idx !== -1) {
-                            u.withdrawals[idx].status = 'PAID';
-                        } else {
-                            let p = u.withdrawals.find(w => w.status === 'PENDING' || w.status === 'PEND1NG');
-                            if (p) p.status = 'PAID';
-                        }
-                        u.markModified('withdrawals');
-                        await u.save();
-                        sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} LTC has been approved!`);
-                    }
-
+                    await approveRequest(reqDoc, u, reqId);
                     editTelegramMessage(chatId, messageId, `✅ **Request Approved**\nUser ID: ${reqDoc.userId}\nAmount:${reqDoc.amount}`);
                 } else {
-                    if (reqDoc.type === 'deposit' && u) {
-                        let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
-                        if (idx !== -1) {
-                            u.deposits[idx].status = 'DECLINED';
-                        } else {
-                            let p = u.deposits.find(d => d.status === 'PENDING');
-                            if (p) p.status = 'DECLINED';
-                        }
-                        u.markModified('deposits');
-                        
-                        let totalApprovedGhs = 0;
-                        u.deposits.forEach(d => {
-                            if (d.status === 'PAID') {
-                                totalApprovedGhs += Number(d.usdtAmount || 1);
-                            }
-                        });
-                        u.ghs = totalApprovedGhs;
-                        await u.save();
-                        sendTelegramMessage(reqDoc.userId, `❌ Your deposit request was declined.`);
-                    } else if (reqDoc.type === 'withdraw' && u) {
-                        u.balance += parseFloat(reqDoc.amount);
-                        let idx = u.withdrawals.findIndex(w => String(w.id) === String(reqId));
-                        if (idx !== -1) {
-                            u.withdrawals[idx].status = 'DECLINED';
-                        } else {
-                            let p = u.withdrawals.find(w => w.status === 'PENDING' || w.status === 'PEND1NG');
-                            if (p) p.status = 'DECLINED';
-                        }
-                        u.markModified('withdrawals');
-                        await u.save();
-                        sendTelegramMessage(reqDoc.userId, `❌ Your withdrawal request was declined and funds refunded.`);
-                    }
-
+                    await rejectRequest(reqDoc, u, reqId);
                     editTelegramMessage(chatId, messageId, `❌ **Request Rejected**\nUser ID: ${reqDoc.userId}\nAmount:${reqDoc.amount}`);
                 }
 
-                await PendingRequest.deleteOne({ reqId });
                 answerCallbackQuery(query.id, "Done!");
             }
         }
@@ -496,6 +519,7 @@ app.get('/', (req, res) => {
     res.send(`<h1>Lite Core Mining Backend Active</h1><p>Please launch via Telegram Bot.</p>`);
 });
 
+// ================== ADMIN PANEL ==================
 app.get('/admin/login', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -531,7 +555,7 @@ app.post('/admin/login', (req, res) => {
     if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
         const sessionToken = "token_" + Math.random().toString(36).substring(2) + Date.now();
         activeSessions.add(sessionToken);
-        
+
         res.setHeader('Set-Cookie', `admin_session=${sessionToken}; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax`);
         return res.redirect('/admin/dashboard');
     }
@@ -657,7 +681,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                     <a href="/admin/logout" class="logout-btn">Logout</a>
                 </div>
             </div>
-            
+
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-title">Total Users</div><div class="stat-value">${totalUsers}</div></div>
                 <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDeposit.toFixed(2)} USDT</div></div>
@@ -717,7 +741,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                             <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@') ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
                             <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
                             <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
-                            <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED</span>'}</p>
+                            <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
                             <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDeposit.toFixed(2)} USDT</span></p>
                             <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdraw.toFixed(4)} LTC</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
                             <p>👥 <b>Referrals Count:</b> L1: ${searchedUser.referrals?.level1?.length || 0} | L2: ${searchedUser.referrals?.level2?.length || 0} | L3: ${searchedUser.referrals?.level3?.length || 0}</p>
@@ -870,11 +894,14 @@ app.post('/admin/manage-plan', checkAdminAuth, async (req, res) => {
     let u = await User.findOne({ id: userId });
     if (!u) return res.status(404).json({ success: false, message: "User not found!" });
 
+    const now = Date.now();
+    settleAccrual(u, now);   // keep profit earned so far at the old rate
+
     if (action === 'activate') {
         u.planActive = true;
         if (u.ghs <= 0) u.ghs = 1;
-        u.planStartDate = Date.now();
-        u.planExpiryDate = Date.now() + (10 * 24 * 60 * 60 * 1000);
+        u.planStartDate = now;
+        u.planExpiryDate = now + PLAN_DURATION_MS;
         await u.save();
         sendTelegramMessage(userId, `⚡ *Plan Activated:* Admin has activated your mining plan for 10 Days!`);
         res.json({ success: true, message: `Plan activated successfully for user ${userId}!` });
@@ -891,119 +918,17 @@ app.post('/admin/manage-plan', checkAdminAuth, async (req, res) => {
 
 app.post('/admin/action', checkAdminAuth, async (req, res) => {
     const { reqId, action } = req.body;
-    const reqDoc = await PendingRequest.findOne({ reqId });
+
+    // atomic take: prevents double approve / double refund
+    const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
     if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
 
     const u = await User.findOne({ id: reqDoc.userId });
 
     if (action === 'approve') {
-        if (reqDoc.type === 'deposit' && u) {
-            let numericDepAmount = reqDoc.usdtAmount ? Number(reqDoc.usdtAmount) : 1;
-            
-            let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
-            if (idx !== -1) {
-                u.deposits[idx].status = 'PAID';
-            } else {
-                let p = u.deposits.find(d => d.status === 'PENDING');
-                if (p) p.status = 'PAID';
-            }
-            u.markModified('deposits');
-
-            let totalApprovedGhs = 0;
-            u.deposits.forEach(d => {
-                if (d.status === 'PAID') {
-                    totalApprovedGhs += Number(d.usdtAmount || 1);
-                }
-            });
-            u.ghs = totalApprovedGhs;
-            u.planActive = true;
-            u.planStartDate = Date.now();
-            u.planExpiryDate = Date.now() + (10 * 24 * 60 * 60 * 1000);
-
-            await u.save();
-
-            if (u.referredBy) {
-                let refL1 = await User.findOne({ id: u.referredBy });
-                if (refL1) {
-                    let commL1 = numericDepAmount * 0.15;
-                    refL1.balance += commL1;
-                    refL1.refEarnings.level1 = (refL1.refEarnings.level1 || 0) + commL1;
-                    refL1.markModified('refEarnings');
-                    await refL1.save();
-                    sendTelegramMessage(refL1.id, `🎁 Received +${commL1.toFixed(4)} USDT (15% Level 1 Referral Commission)!`);
-
-                    if (refL1.referredBy) {
-                        let refL2 = await User.findOne({ id: refL1.referredBy });
-                        if (refL2) {
-                            let commL2 = numericDepAmount * 0.03;
-                            refL2.balance += commL2;
-                            refL2.refEarnings.level2 = (refL2.refEarnings.level2 || 0) + commL2;
-                            refL2.markModified('refEarnings');
-                            await refL2.save();
-                            sendTelegramMessage(refL2.id, `🎁 Received +${commL2.toFixed(4)} USDT (3% Level 2 Referral Commission)!`);
-
-                            if (refL2.referredBy) {
-                                let refL3 = await User.findOne({ id: refL2.referredBy });
-                                if (refL3) {
-                                    let commL3 = numericDepAmount * 0.01;
-                                    refL3.balance += commL3;
-                                    refL3.refEarnings.level3 = (refL3.refEarnings.level3 || 0) + commL3;
-                                    refL3.markModified('refEarnings');
-                                    await refL3.save();
-                                    sendTelegramMessage(refL3.id, `🎁 Received +${commL3.toFixed(4)} USDT (1% Level 3 Referral Commission)!`);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${numericDepAmount} GHS Mining Power added (Valid for 10 Days).`);
-        } else if (reqDoc.type === 'withdraw' && u) {
-            let idx = u.withdrawals.findIndex(w => String(w.id) === String(reqId));
-            if (idx !== -1) {
-                u.withdrawals[idx].status = 'PAID';
-            } else {
-                let p = u.withdrawals.find(w => w.status === 'PENDING' || w.status === 'PEND1NG');
-                if (p) p.status = 'PAID';
-            }
-            u.markModified('withdrawals');
-            await u.save();
-            sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} LTC has been approved!`);
-        }
+        await approveRequest(reqDoc, u, reqId);
     } else if (action === 'reject') {
-        if (reqDoc.type === 'deposit' && u) {
-            let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
-            if (idx !== -1) {
-                u.deposits[idx].status = 'DECLINED';
-            } else {
-                let p = u.deposits.find(d => d.status === 'PENDING');
-                if (p) p.status = 'DECLINED';
-            }
-            u.markModified('deposits');
-            
-            let totalApprovedGhs = 0;
-            u.deposits.forEach(d => {
-                if (d.status === 'PAID') {
-                    totalApprovedGhs += Number(d.usdtAmount || 1);
-                }
-            });
-            u.ghs = totalApprovedGhs;
-            await u.save();
-            sendTelegramMessage(reqDoc.userId, `❌ Your deposit request was declined.`);
-        } else if (reqDoc.type === 'withdraw' && u) {
-            u.balance += parseFloat(reqDoc.amount);
-            let idx = u.withdrawals.findIndex(w => String(w.id) === String(reqId));
-            if (idx !== -1) {
-                u.withdrawals[idx].status = 'DECLINED';
-            } else {
-                let p = u.withdrawals.find(w => w.status === 'PENDING' || w.status === 'PEND1NG');
-                if (p) p.status = 'DECLINED';
-            }
-            u.markModified('withdrawals');
-            await u.save();
-            sendTelegramMessage(reqDoc.userId, `❌ Your withdrawal request was declined and funds refunded.`);
-        }
+        await rejectRequest(reqDoc, u, reqId);
     } else if (action === 'close') {
         if (reqDoc.type === 'deposit' && u) {
             let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
@@ -1019,7 +944,6 @@ app.post('/admin/action', checkAdminAuth, async (req, res) => {
         }
     }
 
-    await PendingRequest.deleteOne({ reqId });
     res.json({ success: true, message: "Action executed successfully!" });
 });
 
@@ -1082,75 +1006,71 @@ app.post('/admin/broadcast', checkAdminAuth, async (req, res) => {
     res.json({ success: true, message: `Broadcast sent to ${count} users successfully!` });
 });
 
+// ================== MINI APP API ==================
 app.get('/api/user/:userId', async (req, res) => {
-    const userId = req.params.userId;
+    const userId = String(req.params.userId);
     let user = await User.findOne({ id: userId });
-    
+
     if (user && user.isBanned) {
         return res.status(403).json({ success: false, isBanned: true, message: "Your account is banned by admin." });
     }
 
+    const now = Date.now();
+
     if (!user) {
         user = new User({ id: userId, username: 'User' });
         await user.save();
-    } else if (user.planActive && user.planExpiryDate && user.planExpiryDate > 0 && Date.now() >= user.planExpiryDate) {
-        user.ghs = 0;
-        user.planActive = false;
-        user.planExpiryDate = 0;
-        user.planStartDate = 0;
+    } else if (user.planActive && user.planExpiryDate && user.planExpiryDate > 0 && now >= user.planExpiryDate) {
+        expireUserPlan(user, now);
         await user.save();
     }
-    res.json(user);
+
+    const price = await getLtcPrice();
+    const data = user.toObject();
+    data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);   // profit waiting to be collected (USD)
+    data.dailyUsd = dailyUsdRate(user, now);                                 // current plan earning per day (USD)
+    data.paidPlan = isPaidPlanActive(user, now);                             // true = bought plan, false = free plan
+    data.ltcPrice = price;
+    res.json(data);
 });
 
+// GHS can only come from approved deposits (admin). The app can not change it.
 app.post('/api/update-ghs', async (req, res) => {
-    const { userId, ghs } = req.body;
-    let u = await User.findOne({ id: userId });
+    const { userId } = req.body;
+    let u = await User.findOne({ id: String(userId) });
     if (u && u.isBanned) return res.status(403).json({ success: false, isBanned: true, message: "Your account is banned." });
-
-    if (!u) {
-        u = new User({ id: userId, ghs: ghs });
-    } else {
-        let realDepositSum = 0;
-        if (u.deposits) {
-            u.deposits.forEach(d => {
-                if (d.status === 'PAID') realDepositSum += Number(d.usdtAmount || 1);
-            });
-        }
-        if (ghs <= realDepositSum) {
-            u.ghs = ghs;
-        } else {
-            u.ghs = realDepositSum;
-        }
-    }
-    await u.save();
-    res.json({ success: true, ghs: u.ghs });
+    res.json({ success: true, ghs: u ? u.ghs : 0 });
 });
 
+// COLLECT: adds the mined profit (converted USDT -> LTC at the live price) to the main balance
 app.post('/api/claim', async (req, res) => {
-    const { userId } = req.body;
+    const userId = String(req.body.userId || '');
     const u = await User.findOne({ id: userId });
-    if (!u || u.isBanned || u.planActive === false) return res.status(400).json({ success: false, message: "User not found, banned or plan deactivated" });
+    if (!u || u.isBanned) return res.status(400).json({ success: false, message: "User not found or banned" });
 
-    if (u.planExpiryDate && u.planExpiryDate > 0 && Date.now() >= u.planExpiryDate) {
-        u.ghs = 0;
-        u.planActive = false;
-        u.planExpiryDate = 0;
-        u.planStartDate = 0;
-        await u.save();
-        return res.status(400).json({ success: false, message: "Your 10-day mining plan has expired." });
-    }
+    const now = Date.now();
+    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
+    if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
 
-    let dailyProfit = u.ghs > 0 ? u.ghs * 0.3 : 0.01;
-    let perSecondRate = dailyProfit / 86400;
-    let elapsedSeconds = (Date.now() - u.lastClaimTime) / 1000;
-    let MinedAmount = Math.max(0, elapsedSeconds * perSecondRate);
+    const price = await getLtcPrice();
+    const ltcAmount = totalUsd / price;
 
-    u.balance += MinedAmount;
-    u.lastClaimTime = Date.now();
-    await u.save();
+    // atomic: only one claim can win (prevents double collect)
+    const updated = await User.findOneAndUpdate(
+        { id: userId, lastClaimTime: u.lastClaimTime },
+        { $inc: { balance: ltcAmount }, $set: { accruedUsd: 0, lastClaimTime: now } },
+        { new: true }
+    );
+    if (!updated) return res.status(409).json({ success: false, message: "Please try again." });
 
-    res.json({ success: true, balance: u.balance, lastClaimTime: u.lastClaimTime });
+    res.json({
+        success: true,
+        balance: updated.balance,
+        lastClaimTime: updated.lastClaimTime,
+        claimedLtc: ltcAmount,
+        claimedUsd: totalUsd,
+        ltcPrice: price
+    });
 });
 
 app.post('/api/deposit', async (req, res) => {
@@ -1163,17 +1083,17 @@ app.post('/api/deposit', async (req, res) => {
 
     const existingPending = await PendingRequest.findOne({ txHash: cleanTxHash });
     if (existingPending) {
-        return res.status(400).json({ 
-            success: false, 
-            message: "This TxHash has already been submitted and is currently pending!" 
+        return res.status(400).json({
+            success: false,
+            message: "This TxHash has already been submitted and is currently pending!"
         });
     }
 
     const existingUserHash = await User.findOne({ "deposits.txHash": cleanTxHash });
     if (existingUserHash) {
-        return res.status(400).json({ 
-            success: false, 
-            message: "This TxHash has already been used! Please provide a new transaction hash." 
+        return res.status(400).json({
+            success: false,
+            message: "This TxHash has already been used! Please provide a new transaction hash."
         });
     }
 
@@ -1187,28 +1107,28 @@ app.post('/api/deposit', async (req, res) => {
 
     let exactUsdtVal = Number(usdtAmount) || 1;
     const reqId = 'dep_' + Date.now();
-    
-    u.deposits.unshift({ 
-        id: reqId, 
-        amount: amount, 
+
+    u.deposits.unshift({
+        id: reqId,
+        amount: amount,
         usdtAmount: exactUsdtVal,
-        coin: coin || 'LTC', 
-        txHash: cleanTxHash, 
-        status: 'PENDING', 
-        date: new Date().toLocaleDateString() 
+        coin: coin || 'LTC',
+        txHash: cleanTxHash,
+        status: 'PENDING',
+        date: new Date().toLocaleDateString()
     });
     u.markModified('deposits');
     await u.save();
 
-    await PendingRequest.create({ 
-        reqId, 
-        type: 'deposit', 
-        userId, 
-        amount: amount, 
+    await PendingRequest.create({
+        reqId,
+        type: 'deposit',
+        userId,
+        amount: amount,
         usdtAmount: exactUsdtVal,
         coin: coin || 'LTC',
-        txHash: cleanTxHash, 
-        status: 'PENDING' 
+        txHash: cleanTxHash,
+        status: 'PENDING'
     });
 
     if (ADMIN_ID) {
@@ -1239,9 +1159,9 @@ app.post('/api/withdraw', async (req, res) => {
 
     const existingPending = await PendingRequest.findOne({ userId: userId, type: 'withdraw', status: 'PENDING' });
     if (existingPending) {
-        return res.status(400).json({ 
-            success: false, 
-            message: "Aapki pehle se ek withdrawal request pending hai. Pehle wo process hone dein!" 
+        return res.status(400).json({
+            success: false,
+            message: "Aapki pehle se ek withdrawal request pending hai. Pehle wo process hone dein!"
         });
     }
 
@@ -1256,23 +1176,23 @@ app.post('/api/withdraw', async (req, res) => {
     u.balance = Math.max(0, u.balance - amt);
 
     const reqId = 'wd_' + Date.now();
-    u.withdrawals.unshift({ 
-        id: reqId, 
-        amount: amt, 
-        address, 
-        status: 'PENDING', 
-        date: new Date().toLocaleDateString() 
+    u.withdrawals.unshift({
+        id: reqId,
+        amount: amt,
+        address,
+        status: 'PENDING',
+        date: new Date().toLocaleDateString()
     });
     u.markModified('withdrawals');
     await u.save();
 
-    await PendingRequest.create({ 
-        reqId, 
-        type: 'withdraw', 
-        userId, 
-        amount: amt, 
-        address, 
-        status: 'PENDING' 
+    await PendingRequest.create({
+        reqId,
+        type: 'withdraw',
+        userId,
+        amount: amt,
+        address,
+        status: 'PENDING'
     });
 
     if (ADMIN_ID) {
@@ -1293,7 +1213,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
-    if (RENDER_URL) {
+    if (RENDER_URL && BOT_TOKEN) {
         try {
             await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${RENDER_URL}/api/webhook/${BOT_TOKEN}`);
             console.log("Telegram Webhook Set Successfully!");
