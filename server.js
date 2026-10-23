@@ -448,19 +448,26 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                const vercelAppUrl = "https://lite-core-1.vercel.app/";
-                const welcomeCaption = `🎁 *Welcome to Lite Core!*\n\nReady to grow your portfolio?\n\n✅ Earn LTC\n✅ Invite Friends\n✅ Instant Payouts\n\n🚀 *Launch the App to begin your journey!*`;
-                const startPhotoUrl = "https://ibb.co/ymZ191Fr";
+                // ===== NEW: updated mini app link, image and professional button layout =====
+                const vercelAppUrl = "https://lite-core-2.vercel.app/";
+                const welcomeCaption =
+`🎉 *Welcome to Lite Core!*
+
+_Mine LTC, invite friends and withdraw instantly._
+
+⛏️ Start mining with free power
+🎁 Buy plans & earn daily profit
+👥 Invite friends & earn 3-level commission
+💸 Withdraw straight to your wallet
+
+👇 *Tap Open Mining to start!*`;
+                const startPhotoUrl = "https://ibb.co/wFg2dtBX";
 
                 const webAppMarkup = {
                     inline_keyboard: [
-                        [
-                            { text: "✅ Lite Core Payments", url: "https://t.me/litecorepayments" },
-                            { text: "💬 Lite Core Official", url: "https://t.me/litecoreofficial" }
-                        ],
-                        [
-                            { text: "🔨 ➔ Open Lite Core Mining ⛏️", web_app: { url: vercelAppUrl } }
-                        ]
+                        [{ text: "📢 Join Official Channel", url: "https://t.me/litecoreofficial" }],
+                        [{ text: "💸 Join Payment Channel", url: "https://t.me/litecorepayments" }],
+                        [{ text: "⛏️ Open Mining", web_app: { url: vercelAppUrl } }]
                     ]
                 };
 
