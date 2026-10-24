@@ -448,7 +448,7 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                // ===== NEW: updated mini app link, image and professional button layout =====
+                // ===== UPDATED VERCEL LINK HERE =====
                 const vercelAppUrl = "https://lite-core-kpwy.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
