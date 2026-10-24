@@ -449,7 +449,7 @@ async function handleWebhookLogic(req, res) {
                 }
 
                 // ===== UPDATED VERCEL LINK HERE =====
-                const vercelAppUrl = "https://lite-core-otok.vercel.app/";
+                const vercelAppUrl = "https://lite-core-l3sd.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
 
