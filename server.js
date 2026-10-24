@@ -449,7 +449,7 @@ async function handleWebhookLogic(req, res) {
                 }
 
                 // ===== UPDATED VERCEL LINK HERE =====
-                const vercelAppUrl = "https://lite-core-otok.vercel.app/";
+                const vercelAppUrl = "https://litecore-3.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
 
@@ -1056,7 +1056,7 @@ app.post('/api/claim', async (req, res) => {
     if (!u || u.isBanned) return res.status(400).json({ success: false, message: "User not found or banned" });
 
     const now = Date.now();
-    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(user, now);
+    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
     if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
 
     const price = await getLtcPrice();
