@@ -1164,7 +1164,7 @@ app.post('/api/withdraw', async (req, res) => {
         return res.status(403).json({ success: false, message: "Account restricted or banned" });
     }
 
-    const existingPending = await PendingRequest.findOne({ userId: userId, type: 'withdraw', status: 'PENDING' },
+    const existingPending = await PendingRequest.findOne({ userId: userId, type: 'withdraw', status: 'PENDING' });
     if (existingPending) {
         return res.status(400).json({
             success: false,
