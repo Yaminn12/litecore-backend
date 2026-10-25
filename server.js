@@ -122,7 +122,7 @@ const userSchema = new mongoose.Schema({
     planExpiryDate: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
     referrals: {
-        level1: { type: Array, default: [] }, // Array of objects storing id, joinedDate, bonusEarned
+        level1: { type: Array, default: [] },
         level2: { type: Array, default: [] },
         level3: { type: Array, default: [] }
     },
@@ -297,9 +297,8 @@ function setRequestStatus(list, reqId, pendingNames, newStatus) {
     }
 }
 
-// ================== UPDATED REFERRAL COMMISSION FUNCTION ==================
 async function payReferralCommissions(depositUser, usdtAmount) {
-    const rates = [0.15, 0.03, 0.01]; // Level 1: 15%, Level 2: 3%, Level 3: 1%
+    const rates = [0.15, 0.03, 0.01];
     let current = depositUser;
     const ltcPrice = await getLtcPrice();
     const depositingUserId = depositUser.id;
@@ -309,19 +308,13 @@ async function payReferralCommissions(depositUser, usdtAmount) {
         const refUser = await User.findOne({ id: current.referredBy });
         if (!refUser) break;
 
-        // Dollar (USDT) amount par commission calculate karein
         const commUsdt = usdtAmount * rates[lvl - 1];
-        // Live LTC price ke hisab se LTC mein convert karein
         const commLtc = commUsdt / ltcPrice;
 
-        // User ka main balance update karein
         refUser.balance += commLtc;
-        
-        // Total referral earnings update karein
         refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commLtc;
         refUser.markModified('refEarnings');
 
-        // Specific referral item ke andar bonus earned update ya add karein
         if (!refUser.referrals[`level${lvl}`]) {
             refUser.referrals[`level${lvl}`] = [];
         }
@@ -376,8 +369,6 @@ async function approveRequest(reqDoc, u, reqId) {
         u.planExpiryDate = now + PLAN_DURATION_MS;
 
         await u.save();
-        
-        // Referral commissions distribute karein
         await payReferralCommissions(u, depAmount);
 
         sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
@@ -623,9 +614,10 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
     const requests = await PendingRequest.find({});
     const totalUsers = await User.countDocuments();
     const allUsers = await User.find({});
+    const liveLtcPrice = await getLtcPrice();
 
     let totalPaidOut = 0;
-    let totalGlobalDeposit = 0;
+    let totalGlobalDepositUsdt = 0;
     let activeDepositUsersCount = 0;
     let activeDepositUsersList = [];
 
@@ -636,7 +628,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 if (d.status === 'PAID') {
                     let depUsdtVal = parseFloat(d.usdtAmount || 1);
                     userActualDepositSum += depUsdtVal;
-                    totalGlobalDeposit += depUsdtVal;
+                    totalGlobalDepositUsdt += depUsdtVal;
                 }
             });
         }
@@ -653,10 +645,12 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
         }
     });
 
+    let totalGlobalDepositLtc = totalGlobalDepositUsdt / liveLtcPrice;
+
     let searchId = req.query.search ? req.query.search.trim() : '';
     let searchedUser = null;
-    let userTotalDeposit = 0;
-    let userTotalWithdraw = 0;
+    let userTotalDepositUsdt = 0;
+    let userTotalWithdrawLtc = 0;
     let userPaidWithdrawCount = 0;
     let totalRefEarn = 0;
 
@@ -669,14 +663,14 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
             if (searchedUser.deposits) {
                 searchedUser.deposits.forEach(d => {
                     if (d.status === 'PAID') {
-                        userTotalDeposit += parseFloat(d.usdtAmount || 1);
+                        userTotalDepositUsdt += parseFloat(d.usdtAmount || 1);
                     }
                 });
             }
             if (searchedUser.withdrawals) {
                 searchedUser.withdrawals.forEach(w => {
                     if (w.status === 'PAID') {
-                        userTotalWithdraw += parseFloat(w.amount || 0);
+                        userTotalWithdrawLtc += parseFloat(w.amount || 0);
                         userPaidWithdrawCount++;
                     }
                 });
@@ -732,11 +726,16 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 </div>
             </div>
 
+            <div style="background: #1c1917; border: 1px solid #292524; border-radius: 10px; padding: 10px 15px; margin-bottom: 15px; font-size: 13px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center;">
+                <span>📈 <b>Live LTC Price:</b> $${liveLtcPrice.toFixed(2)} USDT</span>
+                <span style="font-size: 11px; color: #a8a29e;">Auto-updated</span>
+            </div>
+
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-title">Total Users</div><div class="stat-value">${totalUsers}</div></div>
-                <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDeposit.toFixed(2)} USDT</div></div>
+                <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDepositUsdt.toFixed(2)} USDT<br><span style="font-size:13px; color:#22c55e;">(${totalGlobalDepositLtc.toFixed(4)} LTC)</span></div></div>
                 <div class="stat-card"><div class="stat-title">Total Active Plan Users ($1+)</div><div class="stat-value">${activeDepositUsersCount} Users</div></div>
-                <div class="stat-card"><div class="stat-title">Paid Out</div><div class="stat-value">${totalPaidOut.toFixed(2)} LTC</div></div>
+                <div class="stat-card"><div class="stat-title">Paid Out</div><div class="stat-value">${totalPaidOut.toFixed(4)} LTC<br><span style="font-size:13px; color:#38bdf8;">($${(totalPaidOut * liveLtcPrice).toFixed(2)} USDT)</span></div></div>
                 <div class="stat-card"><div class="stat-title">Pending Requests</div><div class="stat-value">${requests.length}</div></div>
             </div>
 
@@ -754,19 +753,20 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                         <table>
                             <tr><th>User ID</th><th>Username</th><th>Total Deposit</th><th>GHS Power</th><th>Plan Expiry</th></tr>
                             ${activeDepositUsersList.map(depUser => {
-                                let depTotal = 0;
+                                let depTotalUsdt = 0;
                                 if (depUser.deposits) {
                                     depUser.deposits.forEach(d => {
-                                        if (d.status === 'PAID') depTotal += parseFloat(d.usdtAmount || 1);
+                                        if (d.status === 'PAID') depTotalUsdt += parseFloat(d.usdtAmount || 1);
                                     });
                                 }
+                                let depTotalLtc = depTotalUsdt / liveLtcPrice;
                                 let displayUname = depUser.username ? (depUser.username.startsWith('@') ? depUser.username : '@' + depUser.username) : '@User';
                                 let planDaysStr = getPlanDaysFormat(depUser);
                                 return `
                                     <tr>
                                         <td><code>${depUser.id}</code></td>
                                         <td>${displayUname}</td>
-                                        <td><b style="color:#22c55e;">${depTotal.toFixed(2)} USDT</b></td>
+                                        <td><b style="color:#22c55e;">${depTotalUsdt.toFixed(2)} USDT</b><br><span style="font-size:10px; color:#38bdf8;">(${depTotalLtc.toFixed(4)} LTC)</span></td>
                                         <td><b>${depUser.ghs} GHS</b></td>
                                         <td><b style="color:#38bdf8;">${planDaysStr}</b></td>
                                     </tr>
@@ -786,14 +786,14 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                     </form>
                     ${searchedUser ? `
                         <div class="user-details-box">
-                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@') ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
-                            <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
+                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@' ) ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
+                            <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> <span style="color:#22c55e;">($${(searchedUser.balance * liveLtcPrice).toFixed(2)} USDT)</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
                             <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
                             <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
-                            <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDeposit.toFixed(2)} USDT</span></p>
-                            <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdraw.toFixed(4)} LTC</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
+                            <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDepositUsdt.toFixed(2)} USDT</span> <span style="color:#38bdf8;">(${(userTotalDepositUsdt / liveLtcPrice).toFixed(4)} LTC)</span></p>
+                            <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdrawLtc.toFixed(4)} LTC</span> <span style="color:#38bdf8;">($${(userTotalWithdrawLtc * liveLtcPrice).toFixed(2)} USDT)</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
                             <p>👥 <b>Referrals Count:</b> L1: ${searchedUser.referrals?.level1?.length || 0} | L2: ${searchedUser.referrals?.level2?.length || 0} | L3: ${searchedUser.referrals?.level3?.length || 0}</p>
-                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} LTC</span></p>
+                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} LTC</span> <span style="color:#22c55e;">($${(totalRefEarn * liveLtcPrice).toFixed(2)} USDT)</span></p>
                             <p>🔗 <b>Referred By ID:</b> ${searchedUser.referredBy || 'Direct Join'}</p>
                             <hr style="border-color:#292524; margin:12px 0;">
                             <b>⚙️ Manage User Balance, Plan & Status:</b>
@@ -1073,7 +1073,6 @@ app.get('/api/user/:userId', async (req, res) => {
     const price = await getLtcPrice();
     const data = user.toObject();
 
-    // Format referrals lists to ensure bonusEarned is correctly structured for the frontend
     ['level1', 'level2', 'level3'].forEach(lvl => {
         if (data.referrals && Array.isArray(data.referrals[lvl])) {
             data.referrals[lvl] = data.referrals[lvl].map(r => {
