@@ -3,7 +3,6 @@ const mongoose = require('mongoose');
 const app = express();
 
 // ================== SETTINGS ==================
-// IMPORTANT: put these in Render -> Environment (never write secrets in code)
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) console.error('❌ BOT_TOKEN is missing! Add BOT_TOKEN in Render -> Environment.');
 const ADMIN_ID = process.env.ADMIN_ID || "7108686404";
@@ -13,14 +12,10 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
 
 // ================== MINING RULES ==================
-// 1 GHS = $1.  Paid plan: every GHS earns $0.30 per day for 10 days.
-// Free plan (new users / no active paid plan): $0.01 per day.
-// Deposit NEVER adds to the user's balance. Only "Collect" (claim) adds mined profit.
 const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
 const PAID_RATE_PER_GHS_USD = 0.30;
 const FREE_DAILY_USD = 0.01;
 
-// Live LTC price in USDT (cached 60 seconds). Balance is stored in LTC.
 let ltcPriceCache = { price: 60, time: 0 };
 async function getLtcPrice() {
     if (Date.now() - ltcPriceCache.time < 60000) return ltcPriceCache.price;
@@ -47,7 +42,6 @@ function dailyUsdRate(u, now = Date.now()) {
     return isPaidPlanActive(u, now) ? Number(u.ghs) * PAID_RATE_PER_GHS_USD : FREE_DAILY_USD;
 }
 
-// USD mined since lastClaimTime (paid rate until the plan ends, free rate after)
 function accrueUsd(u, now = Date.now()) {
     const last = Number(u.lastClaimTime) || now;
     if (now <= last) return 0;
@@ -66,7 +60,6 @@ function accrueUsd(u, now = Date.now()) {
     return usd;
 }
 
-// Lock in the profit earned so far (at the OLD rate) before the plan changes.
 function settleAccrual(u, now = Date.now()) {
     u.accruedUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
     u.lastClaimTime = now;
@@ -129,9 +122,9 @@ const userSchema = new mongoose.Schema({
     planExpiryDate: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
     referrals: {
-        level1: { type: [String], default: [] },
-        level2: { type: [String], default: [] },
-        level3: { type: [String], default: [] }
+        level1: { type: Array, default: [] }, // Array of objects storing id, joinedDate, bonusEarned
+        level2: { type: Array, default: [] },
+        level3: { type: Array, default: [] }
     },
     refEarnings: {
         level1: { type: Number, default: 0 },
@@ -242,7 +235,6 @@ async function answerCallbackQuery(callbackQueryId, text) {
     }
 }
 
-// ================== AUTO PLAN EXPIRY (every 5 minutes) ==================
 setInterval(async () => {
     try {
         const currentTime = Date.now();
@@ -260,9 +252,6 @@ setInterval(async () => {
                 `❌ *Plan Expired:* Your plan was expired plzz renew plan agin 🚀`
             );
         }
-        if (expiredUsers.length > 0) {
-            console.log(`⚡ Auto-expired ${expiredUsers.length} user plans.`);
-        }
     } catch (err) {
         console.log("Background Plan Expiry Error:", err);
     }
@@ -274,7 +263,6 @@ function getPlanDaysFormat(user) {
     }
 
     let startTimestamp = user.planStartDate;
-
     if (!startTimestamp || startTimestamp === 0) {
         if (user.deposits && Array.isArray(user.deposits)) {
             const paidDep = user.deposits.find(d => d.status === 'PAID');
@@ -286,14 +274,12 @@ function getPlanDaysFormat(user) {
             }
         }
     }
-
     if (!startTimestamp || startTimestamp === 0) {
         startTimestamp = Date.now();
     }
 
     const now = Date.now();
     const elapsed = now - startTimestamp;
-
     let daysPassed = Math.floor(elapsed / (1000 * 60 * 60 * 24)) + 1;
     if (daysPassed > 10) daysPassed = 10;
     if (daysPassed < 1) daysPassed = 1;
@@ -301,7 +287,6 @@ function getPlanDaysFormat(user) {
     return `${daysPassed}/10 Days`;
 }
 
-// ================== REQUEST APPROVE / REJECT (used by bot buttons and admin panel) ==================
 function setRequestStatus(list, reqId, pendingNames, newStatus) {
     let idx = list.findIndex(x => String(x.id) === String(reqId));
     if (idx !== -1) {
@@ -312,11 +297,12 @@ function setRequestStatus(list, reqId, pendingNames, newStatus) {
     }
 }
 
-// ================== UPDATED REFERRAL COMMISSION (USDT Base -> Converted to LTC) ==================
+// ================== UPDATED REFERRAL COMMISSION FUNCTION ==================
 async function payReferralCommissions(depositUser, usdtAmount) {
-    const rates = [0.15, 0.03, 0.01]; // 15%, 3%, 1%
+    const rates = [0.15, 0.03, 0.01]; // Level 1: 15%, Level 2: 3%, Level 3: 1%
     let current = depositUser;
-    const ltcPrice = await getLtcPrice(); // Live LTC price fetch karein
+    const ltcPrice = await getLtcPrice();
+    const depositingUserId = depositUser.id;
 
     for (let lvl = 1; lvl <= 3; lvl++) {
         if (!current.referredBy) break;
@@ -325,14 +311,43 @@ async function payReferralCommissions(depositUser, usdtAmount) {
 
         // Dollar (USDT) amount par commission calculate karein
         const commUsdt = usdtAmount * rates[lvl - 1];
-        
         // Live LTC price ke hisab se LTC mein convert karein
         const commLtc = commUsdt / ltcPrice;
 
-        // User ka balance aur referral earnings update karein
+        // User ka main balance update karein
         refUser.balance += commLtc;
+        
+        // Total referral earnings update karein
         refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commLtc;
         refUser.markModified('refEarnings');
+
+        // Specific referral item ke andar bonus earned update ya add karein
+        if (!refUser.referrals[`level${lvl}`]) {
+            refUser.referrals[`level${lvl}`] = [];
+        }
+        
+        let refList = refUser.referrals[`level${lvl}`];
+        let existingRefIndex = refList.findIndex(r => (typeof r === 'string' ? r === depositingUserId : r.id === depositingUserId));
+
+        if (existingRefIndex !== -1) {
+            if (typeof refList[existingRefIndex] === 'string') {
+                refList[existingRefIndex] = {
+                    id: depositingUserId,
+                    joinedDate: 'Active',
+                    bonusEarned: commLtc
+                };
+            } else {
+                refList[existingRefIndex].bonusEarned = (Number(refList[existingRefIndex].bonusEarned) || 0) + commLtc;
+            }
+        } else {
+            refList.push({
+                id: depositingUserId,
+                joinedDate: 'Active',
+                bonusEarned: commLtc
+            });
+        }
+        refUser.markModified(`referrals.level${lvl}`);
+
         await refUser.save();
 
         sendTelegramMessage(
@@ -351,11 +366,9 @@ async function approveRequest(reqDoc, u, reqId) {
         setRequestStatus(u.deposits, reqId, ['PENDING'], 'PAID');
         u.markModified('deposits');
 
-        // 1) lock in profit earned so far at the OLD rate
         const now = Date.now();
         settleAccrual(u, now);
 
-        // 2) activate the bought plan. NO balance is added to the user.
         const hadPaidPlan = isPaidPlanActive(u, now);
         u.ghs = hadPaidPlan ? Number(u.ghs) + depAmount : depAmount;
         u.planActive = true;
@@ -364,7 +377,7 @@ async function approveRequest(reqDoc, u, reqId) {
 
         await u.save();
         
-        // USDT amount pass ki ja rahi hai taaki commission dollar ke base par calculate ho
+        // Referral commissions distribute karein
         await payReferralCommissions(u, depAmount);
 
         sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
@@ -440,27 +453,42 @@ async function handleWebhookLogic(req, res) {
 
                 if (isNewUser && user.referredBy) {
                     const l1Id = user.referredBy;
-                    await User.updateOne(
-                        { id: l1Id },
-                        { $addToSet: { "referrals.level1": chatId } }
-                    );
+                    let refL1User = await User.findOne({ id: l1Id });
+                    if (refL1User) {
+                        let exists = refL1User.referrals.level1.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
+                        if (!exists) {
+                            refL1User.referrals.level1.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
+                            refL1User.markModified('referrals.level1');
+                            await refL1User.save();
+                        }
+                    }
                     sendTelegramMessage(l1Id, `🎁 *New Level 1 Referral Joined!*\nUser ID: \`${chatId}\``);
 
                     const refL1 = await User.findOne({ id: l1Id });
                     if (refL1 && refL1.referredBy) {
                         const l2Id = refL1.referredBy;
-                        await User.updateOne(
-                            { id: l2Id },
-                            { $addToSet: { "referrals.level2": chatId } }
-                        );
+                        let refL2User = await User.findOne({ id: l2Id });
+                        if (refL2User) {
+                            let existsL2 = refL2User.referrals.level2.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
+                            if (!existsL2) {
+                                refL2User.referrals.level2.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
+                                refL2User.markModified('referrals.level2');
+                                await refL2User.save();
+                            }
+                        }
 
                         const refL2 = await User.findOne({ id: l2Id });
                         if (refL2 && refL2.referredBy) {
                             const l3Id = refL2.referredBy;
-                            await User.updateOne(
-                                { id: l3Id },
-                                { $addToSet: { "referrals.level3": chatId } }
-                            );
+                            let refL3User = await User.findOne({ id: l3Id });
+                            if (refL3User) {
+                                let existsL3 = refL3User.referrals.level3.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
+                                if (!existsL3) {
+                                    refL3User.referrals.level3.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
+                                    refL3User.markModified('referrals.level3');
+                                    await refL3User.save();
+                                }
+                            }
                         }
                     }
                 }
@@ -758,7 +786,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                     </form>
                     ${searchedUser ? `
                         <div class="user-details-box">
-                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@' ) ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
+                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@') ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
                             <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
                             <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
                             <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
