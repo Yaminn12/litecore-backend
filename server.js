@@ -312,19 +312,34 @@ function setRequestStatus(list, reqId, pendingNames, newStatus) {
     }
 }
 
-async function payReferralCommissions(depositUser, amount) {
-    const rates = [0.15, 0.03, 0.01];
+// ================== UPDATED REFERRAL COMMISSION (USDT Base -> Converted to LTC) ==================
+async function payReferralCommissions(depositUser, usdtAmount) {
+    const rates = [0.15, 0.03, 0.01]; // 15%, 3%, 1%
     let current = depositUser;
+    const ltcPrice = await getLtcPrice(); // Live LTC price fetch karein
+
     for (let lvl = 1; lvl <= 3; lvl++) {
         if (!current.referredBy) break;
         const refUser = await User.findOne({ id: current.referredBy });
         if (!refUser) break;
-        const comm = amount * rates[lvl - 1];
-        refUser.balance += comm;
-        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + comm;
+
+        // Dollar (USDT) amount par commission calculate karein
+        const commUsdt = usdtAmount * rates[lvl - 1];
+        
+        // Live LTC price ke hisab se LTC mein convert karein
+        const commLtc = commUsdt / ltcPrice;
+
+        // User ka balance aur referral earnings update karein
+        refUser.balance += commLtc;
+        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commLtc;
         refUser.markModified('refEarnings');
         await refUser.save();
-        sendTelegramMessage(refUser.id, `🎁 Received +${comm.toFixed(4)} USDT (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`);
+
+        sendTelegramMessage(
+            refUser.id, 
+            `🎁 Received +${commLtc.toFixed(4)} LTC ($${commUsdt.toFixed(2)} USDT) (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`
+        );
+        
         current = refUser;
     }
 }
@@ -348,6 +363,8 @@ async function approveRequest(reqDoc, u, reqId) {
         u.planExpiryDate = now + PLAN_DURATION_MS;
 
         await u.save();
+        
+        // USDT amount pass ki ja rahi hai taaki commission dollar ke base par calculate ho
         await payReferralCommissions(u, depAmount);
 
         sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
@@ -448,7 +465,6 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                // ===== UPDATED VERCEL LINK HERE =====
                 const vercelAppUrl = "https://lite-core-l3sd.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
@@ -496,7 +512,6 @@ _Mine LTC, invite friends and withdraw instantly._
                 const isApprove = data.startsWith('approve_');
                 const reqId = data.replace(isApprove ? 'approve_' : 'reject_', '');
 
-                // atomic: only one tap can take the request (prevents double credit)
                 const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
                 if (!reqDoc) return answerCallbackQuery(query.id, "Request already handled!");
 
@@ -704,7 +719,6 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 <div class="nav-tab" onclick="switchTab('tab-broadcast', this)">📢 Broadcast</div>
             </div>
 
-            <!-- TAB 1: USERS -->
             <div id="tab-users" class="tab-content active">
                 <div class="card">
                     <h3>👥 Users With Active Plans ($1+ Deposits Only)</h3>
@@ -735,7 +749,6 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 </div>
             </div>
 
-            <!-- TAB 2: SEARCH & MANAGE -->
             <div id="tab-search" class="tab-content">
                 <div class="card">
                     <h3>🔍 Search User Details & Manage Plan</h3>
@@ -745,14 +758,14 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                     </form>
                     ${searchedUser ? `
                         <div class="user-details-box">
-                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@') ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
+                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@' ) ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
                             <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
                             <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
                             <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
                             <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDeposit.toFixed(2)} USDT</span></p>
                             <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdraw.toFixed(4)} LTC</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
                             <p>👥 <b>Referrals Count:</b> L1: ${searchedUser.referrals?.level1?.length || 0} | L2: ${searchedUser.referrals?.level2?.length || 0} | L3: ${searchedUser.referrals?.level3?.length || 0}</p>
-                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} USDT</span></p>
+                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} LTC</span></p>
                             <p>🔗 <b>Referred By ID:</b> ${searchedUser.referredBy || 'Direct Join'}</p>
                             <hr style="border-color:#292524; margin:12px 0;">
                             <b>⚙️ Manage User Balance, Plan & Status:</b>
@@ -776,7 +789,6 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 </div>
             </div>
 
-            <!-- TAB 3: PENDING REQUESTS -->
             <div id="tab-requests" class="tab-content">
                 <div class="card">
                     <h3>⏳ Pending Requests</h3>
@@ -801,7 +813,6 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                 </div>
             </div>
 
-            <!-- TAB 4: BROADCAST -->
             <div id="tab-broadcast" class="tab-content">
                 <div class="card">
                     <h3>📢 Broadcast Message with Photo to All Users</h3>
@@ -902,7 +913,7 @@ app.post('/admin/manage-plan', checkAdminAuth, async (req, res) => {
     if (!u) return res.status(404).json({ success: false, message: "User not found!" });
 
     const now = Date.now();
-    settleAccrual(u, now);   // keep profit earned so far at the old rate
+    settleAccrual(u, now);
 
     if (action === 'activate') {
         u.planActive = true;
@@ -926,7 +937,6 @@ app.post('/admin/manage-plan', checkAdminAuth, async (req, res) => {
 app.post('/admin/action', checkAdminAuth, async (req, res) => {
     const { reqId, action } = req.body;
 
-    // atomic take: prevents double approve / double refund
     const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
     if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
 
@@ -1034,14 +1044,13 @@ app.get('/api/user/:userId', async (req, res) => {
 
     const price = await getLtcPrice();
     const data = user.toObject();
-    data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);   // profit waiting to be collected (USD)
-    data.dailyUsd = dailyUsdRate(user, now);                                 // current plan earning per day (USD)
-    data.paidPlan = isPaidPlanActive(user, now);                             // true = bought plan, false = free plan
+    data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);
+    data.dailyUsd = dailyUsdRate(user, now);
+    data.paidPlan = isPaidPlanActive(user, now);
     data.ltcPrice = price;
     res.json(data);
 });
 
-// GHS can only come from approved deposits (admin). The app can not change it.
 app.post('/api/update-ghs', async (req, res) => {
     const { userId } = req.body;
     let u = await User.findOne({ id: String(userId) });
@@ -1049,7 +1058,6 @@ app.post('/api/update-ghs', async (req, res) => {
     res.json({ success: true, ghs: u ? u.ghs : 0 });
 });
 
-// COLLECT: adds the mined profit (converted USDT -> LTC at the live price) to the main balance
 app.post('/api/claim', async (req, res) => {
     const userId = String(req.body.userId || '');
     const u = await User.findOne({ id: userId });
@@ -1062,7 +1070,6 @@ app.post('/api/claim', async (req, res) => {
     const price = await getLtcPrice();
     const ltcAmount = totalUsd / price;
 
-    // atomic: only one claim can win (prevents double collect)
     const updated = await User.findOneAndUpdate(
         { id: userId, lastClaimTime: u.lastClaimTime },
         { $inc: { balance: ltcAmount }, $set: { accruedUsd: 0, lastClaimTime: now } },
