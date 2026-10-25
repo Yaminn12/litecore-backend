@@ -493,7 +493,7 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                const vercelAppUrl = "https://lite-core-l3sd.vercel.app/";
+                const vercelAppUrl = "https://lite-core-0r7t.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
 
@@ -1072,6 +1072,23 @@ app.get('/api/user/:userId', async (req, res) => {
 
     const price = await getLtcPrice();
     const data = user.toObject();
+
+    // Format referrals lists to ensure bonusEarned is correctly structured for the frontend
+    ['level1', 'level2', 'level3'].forEach(lvl => {
+        if (data.referrals && Array.isArray(data.referrals[lvl])) {
+            data.referrals[lvl] = data.referrals[lvl].map(r => {
+                if (typeof r === 'string') {
+                    return { id: r, joinedDate: 'Active', bonusEarned: 0 };
+                }
+                return {
+                    id: r.id || r,
+                    joinedDate: r.joinedDate || 'Active',
+                    bonusEarned: Number(r.bonusEarned || 0)
+                };
+            });
+        }
+    });
+
     data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);
     data.dailyUsd = dailyUsdRate(user, now);
     data.paidPlan = isPaidPlanActive(user, now);
