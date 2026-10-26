@@ -10,6 +10,7 @@ const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
+const VERCEL_APP_URL = "https://lite-core-0r7t.vercel.app/";
 
 // ================== MINING RULES ==================
 const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
@@ -484,7 +485,6 @@ async function handleWebhookLogic(req, res) {
                     }
                 }
 
-                const vercelAppUrl = "https://lite-core-0r7t.vercel.app/";
                 const welcomeCaption =
 `🎉 *Welcome to Lite Core!*
 
@@ -502,7 +502,7 @@ _Mine LTC, invite friends and withdraw instantly._
                     inline_keyboard: [
                         [{ text: "📢 Join Official Channel", url: "https://t.me/litecoreofficial" }],
                         [{ text: "💸 Join Payment Channel", url: "https://t.me/litecorepayments" }],
-                        [{ text: "⛏️ Open Mining", web_app: { url: vercelAppUrl } }]
+                        [{ text: "⛏️ Open Mining", web_app: { url: VERCEL_APP_URL } }]
                     ]
                 };
 
