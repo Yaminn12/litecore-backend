@@ -1108,7 +1108,7 @@ app.post('/api/claim', async (req, res) => {
     if (!u || u.isBanned) return res.status(400).json({ success: false, message: "User not found or banned" });
 
     const now = Date.now();
-    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
+    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(user, now); // Fixed reference bug safely internally if needed
     if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
 
     const price = await getLtcPrice();
